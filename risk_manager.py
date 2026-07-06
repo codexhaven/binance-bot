@@ -11,8 +11,6 @@ from typing import Dict, Any, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api_client import curl_get, curl_post
 
-# ctx: codexhaven
-
 def calc_position_size(balance: float, price: float, risk_pct: float, step_size: float, min_notional: float) -> float:
     """
     Calculates the optimal position size based on account balance and risk percentage.
@@ -30,13 +28,25 @@ def calc_position_size(balance: float, price: float, risk_pct: float, step_size:
     """
     if price <= 0:
         return 0.0
+    if balance < 0:
+        return 0.0
+    if risk_pct < 0:
+        risk_pct = 0.0
+    if step_size <= 0:
+        step_size = 0.001
+    if min_notional < 0:
+        min_notional = 0.0
 
     # Calculate raw size based on risk
     raw_size = (balance * risk_pct) / price
     
+    # Handle step_size precision
+    if step_size < 1:
+        precision = abs(math.log10(step_size))
+    else:
+        precision = 0
+    
     # Floor to the nearest step size to avoid "precision" errors
-    # Example: if step_size is 0.001, 1.23456 -> 1.234
-    precision = abs(math.log10(step_size)) if step_size < 1 else 0
     size = math.floor(raw_size * (10**precision)) / (10**precision)
     
     # Ensure the order meets the minimum notional requirement
@@ -58,8 +68,11 @@ def fetch_mark_price(symbol: str, api_key: str, secret: str) -> float:
         secret: Binance Secret Key.
 
     Returns:
-        The mark price as a float.
+        The mark price as a float. Returns 0.0 on error.
     """
+    if not symbol or not isinstance(symbol, str):
+        return 0.0
+        
     url = "https://fapi.binance.com/fapi/v1/premiumIndex"
     timestamp = int(time.time() * 1000)
     
@@ -86,6 +99,9 @@ def convert_dust(asset: str, api_key: str, secret: str) -> str:
     Returns:
         The raw JSON response from the API.
     """
+    if not asset or not isinstance(asset, str):
+        return '{"error": "Invalid asset"}'
+        
     url = "https://api.binance.com/sapi/v1/asset/assetDustTransfer"
     timestamp = int(time.time() * 1000)
     payload = f"asset={asset}"
@@ -105,14 +121,20 @@ def calculate_sl_tp(entry_price: float, side: str, sl_pct: float, tp_pct: float)
     Returns:
         A dictionary containing 'sl' and 'tp' prices.
     """
-    if side.upper() == 'BUY':
+    if entry_price <= 0:
+        raise ValueError("Entry price must be positive")
+    if sl_pct < 0 or tp_pct < 0:
+        raise ValueError("Percentages must be non-negative")
+    side_upper = side.upper()
+    if side_upper not in ['BUY', 'SELL']:
+        raise ValueError("Side must be either 'BUY' or 'SELL'")
+        
+    if side_upper == 'BUY':
         sl = entry_price * (1 - sl_pct)
         tp = entry_price * (1 + tp_pct)
-    elif side.upper() == 'SELL':
+    else:  # SELL
         sl = entry_price * (1 + sl_pct)
         tp = entry_price * (1 - tp_pct)
-    else:
-        raise ValueError("Side must be either 'BUY' or 'SELL'")
         
     return {"sl": sl, "tp": tp}
 
@@ -128,3 +150,18 @@ if __name__ == "__main__":
     # Test SL/TP
     levels = calculate_sl_tp(50000.0, 'BUY', 0.02, 0.05)
     print(f"SL/TP Levels: {levels}") # Expected SL: 49000, TP: 52500
+    
+    # Edge case tests
+    print("\nEdge case tests:")
+    print(f"Zero balance: {calc_position_size(0.0, 50000.0, 0.01, 0.001, 5.0)}")
+    print(f"Zero price: {calc_position_size(1000.0, 0.0, 0.01, 0.001, 5.0)}")
+    print(f"Negative risk: {calc_position_size(1000.0, 50000.0, -0.01, 0.001, 5.0)}")
+    print(f"Invalid symbol mark price: {fetch_mark_price('', 'key', 'secret')}")
+    try:
+        calculate_sl_tp(50000.0, 'INVALID', 0.02, 0.05)
+    except ValueError as e:
+        print(f"Invalid side caught: {e}")
+    try:
+        calculate_sl_tp(-50000.0, 'BUY', 0.02, 0.05)
+    except ValueError as e:
+        print(f"Negative entry price caught: {e}")
