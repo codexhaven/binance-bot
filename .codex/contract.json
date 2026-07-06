@@ -1,0 +1,307 @@
+{
+  "research": "The bot will run on a Linux host with Python 3 and use Binance REST (curl) and WebSocket (wscat via curl is not feasible, so we will rely on Binance's WS endpoint via the 'websocat' binary invoked through a shell command). Persistent state (trade log, weight usage, paper balances) will be stored in a local SQLite database accessed via the sqlite3 CLI. All core actions—fetching klines, placing orders, retrieving account info—are expressed as concrete curl commands or sqlite3 statements, enabling a fully buildable architecture.",
+  "modules": {
+    "api_client.py": {
+      "description": "Low‑level wrapper around Binance REST endpoints using curl; returns raw JSON strings.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "curl_get",
+          "params": [
+            {"name": "url", "type": "str"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"},
+            {"name": "timestamp", "type": "int"}
+          ],
+          "returns": "str",
+          "command": "curl -s -H \"X-MBX-APIKEY: $api_key\" \"${url}?timestamp=$timestamp&signature=$(python3 -c 'import hmac,hashlib,sys; print(hmac.new(b\"$secret\", sys.argv[1].encode(), hashlib.sha256).hexdigest())' \"timestamp=$timestamp\")\"",
+          "description": "Perform a signed GET request to Binance and return the raw JSON response."
+        },
+        {
+          "type": "function",
+          "name": "curl_post",
+          "params": [
+            {"name": "url", "type": "str"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"},
+            {"name": "payload", "type": "str"},
+            {"name": "timestamp", "type": "int"}
+          ],
+          "returns": "str",
+          "command": "curl -s -X POST -H \"Content-Type: application/x-www-form-urlencoded\" -H \"X-MBX-APIKEY: $api_key\" \"${url}?timestamp=$timestamp&signature=$(python3 -c 'import hmac,hashlib,sys; print(hmac.new(b\"$secret\", sys.argv[1].encode(), hashlib.sha256).hexdigest())' \"timestamp=$timestamp\")\" -d \"$payload\"",
+          "description": "Perform a signed POST request (used for order placement) and return raw JSON."
+        }
+      ],
+      "imports": []
+    },
+    "kline_stream.py": {
+      "description": "Manages real‑time kline WebSocket stream, buffers candles, and reconciles the first candle via REST.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "start_kline_ws",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "interval", "type": "str"},
+            {"name": "callback", "type": "str"}
+          ],
+          "returns": "None",
+          "command": "websocat -t \"wss://stream.binance.com:9443/ws/${symbol}@kline_${interval}\" | while read line; do python3 -c \"import json,sys; data=json.loads('$line'); print(data['k']['t'],data['k']['o'],data['k']['h'],data['k']['l'],data['k']['c'],data['k']['v'])\" | xargs -I {} bash -c \"$callback {}\"; done",
+          "description": "Connect to Binance kline WS, parse each candle, and invoke the supplied Python callback with space‑separated OHLCV."
+        },
+        {
+          "type": "function",
+          "name": "fetch_latest_kline",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "interval", "type": "str"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"}
+          ],
+          "returns": "str",
+          "command": "python3 -c \"import time,sys; from api_client import curl_get; print(curl_get(f'https://api.binance.com/api/v3/klines', sys.argv[1], sys.argv[2], f'symbol={sys.argv[3]}&interval={sys.argv[4]}&limit=1', int(time.time()*1000)))\" \"$api_key\" \"$secret\" \"$symbol\" \"$interval\"",
+          "description": "Fetch the most recent completed kline via REST for reconciliation."
+        }
+      ],
+      "imports": ["api_client.py"]
+    },
+    "indicator.py": {
+      "description": "Calculates RSI and MACD from a list of closing prices.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "calc_rsi",
+          "params": [
+            {"name": "closes", "type": "list[float]"},
+            {"name": "period", "type": "int"}
+          ],
+          "returns": "float",
+          "command": "python3 - <<'PY'\nimport sys,statistics\ncloses=eval(sys.argv[1])\nperiod=int(sys.argv[2])\nchanges=[closes[i+1]-closes[i] for i in range(-period-1,-1)]\nup=statistics.mean([c for c in changes if c>0])\ndown=abs(statistics.mean([c for c in changes if c<0]))\nrs=up/down if down!=0 else 0\nprint(100-(100/(1+rs)))\nPY \"${closes}\" \"${period}\"",
+          "description": "Return the latest RSI value."
+        },
+        {
+          "type": "function",
+          "name": "calc_macd",
+          "params": [
+            {"name": "closes", "type": "list[float]"},
+            {"name": "fast", "type": "int"},
+            {"name": "slow", "type": "int"},
+            {"name": "signal", "type": "int"}
+          ],
+          "returns": "tuple[float,float,float]",
+          "command": "python3 - <<'PY'\nimport sys, numpy as np\ncloses=eval(sys.argv[1])\nfast=int(sys.argv[2]); slow=int(sys.argv[3]); signal=int(sys.argv[4])\nema=lambda p: np.convolve(closes, np.ones(p)/p, mode='valid')\nfast_ema=ema(fast)\nslow_ema=ema(slow)[-(len(fast_ema)):]\nmacd_line=fast_ema-slow_ema\nsignal_line=np.convolve(macd_line, np.ones(signal)/signal, mode='valid')\nhist=macd_line[-len(signal_line):]-signal_line\nprint(macd_line[-1], signal_line[-1], hist[-1])\nPY \"${closes}\" \"${fast}\" \"${slow}\" \"${signal}\"",
+          "description": "Return (macd, signal, histogram) for the latest candle."
+        }
+      ],
+      "imports": []
+    },
+    "order_engine.py": {
+      "description": "Creates, validates and sends Binance orders (market, limit, OCO, STOP_MARKET). Adjusts quantities to step size and prices to tick size.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "place_market_order",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "side", "type": "str"},
+            {"name": "quantity", "type": "float"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"}
+          ],
+          "returns": "str",
+          "command": "python3 -c \"from api_client import curl_post; import json,sys; payload=f'symbol={sys.argv[1]}&side={sys.argv[2]}&type=MARKET&quantity={sys.argv[3]}'; print(curl_post('https://api.binance.com/api/v3/order', sys.argv[4], sys.argv[5], payload, int(time.time()*1000)))\" \"$symbol\" \"$side\" \"$quantity\" \"$api_key\" \"$secret\"",
+          "description": "Send a signed market order and return Binance JSON response."
+        },
+        {
+          "type": "function",
+          "name": "place_oco_order",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "side", "type": "str"},
+            {"name": "quantity", "type": "float"},
+            {"name": "price", "type": "float"},
+            {"name": "stop_price", "type": "float"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"}
+          ],
+          "returns": "str",
+          "command": "python3 -c \"from api_client import curl_post; import sys,time; payload='symbol='+sys.argv[1]+'&side='+sys.argv[2]+'&type=OCO&quantity='+sys.argv[3]+'&price='+sys.argv[4]+'&stopPrice='+sys.argv[5]+'&stopLimitTimeInForce=GTC'; print(curl_post('https://api.binance.com/api/v3/order/oco', sys.argv[6], sys.argv[7], payload, int(time.time()*1000)))\" \"$symbol\" \"$side\" \"$quantity\" \"$price\" \"$stop_price\" \"$api_key\" \"$secret\"",
+          "description": "Create an OCO order (limit TP + stop‑loss) for Spot."
+        },
+        {
+          "type": "function",
+          "name": "place_stop_market_futures",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "side", "type": "str"},
+            {"name": "quantity", "type": "float"},
+            {"name": "stop_price", "type": "float"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"}
+          ],
+          "returns": "str",
+          "command": "python3 -c \"from api_client import curl_post; import sys,time; payload='symbol='+sys.argv[1]+'&side='+sys.argv[2]+'&type=STOP_MARKET&quantity='+sys.argv[3]+'&stopPrice='+sys.argv[4]; print(curl_post('https://fapi.binance.com/fapi/v1/order', sys.argv[5], sys.argv[6], payload, int(time.time()*1000)))\" \"$symbol\" \"$side\" \"$quantity\" \"$stop_price\" \"$api_key\" \"$secret\"",
+          "description": "Place a STOP_MARKET order for USDT‑M Futures (used for SL/TP)."
+        }
+      ],
+      "imports": ["api_client.py"]
+    },
+    "risk_manager.py": {
+      "description": "Evaluates margin, calculates position size, builds SL/TP values, and triggers dust conversion.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "calc_position_size",
+          "params": [
+            {"name": "balance", "type": "float"},
+            {"name": "price", "type": "float"},
+            {"name": "risk_pct", "type": "float"},
+            {"name": "step_size", "type": "float"},
+            {"name": "min_notional", "type": "float"}
+          ],
+          "returns": "float",
+          "command": "python3 - <<'PY'\nimport sys,math\nbal=float(sys.argv[1]); price=float(sys.argv[2]); risk=float(sys.argv[3]); step=float(sys.argv[4]); min_not=float(sys.argv[5])\nraw=bal*risk/price\nsize=math.floor(raw/step)*step\nif size*price<min_not:\n    size=math.ceil(min_not/price/step)*step\nprint(size)\nPY \"${balance}\" \"${price}\" \"${risk_pct}\" \"${step_size}\" \"${min_notional}\"",
+          "description": "Return quantity respecting step size and Binance min‑notional."
+        },
+        {
+          "type": "function",
+          "name": "fetch_mark_price",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"}
+          ],
+          "returns": "float",
+          "command": "python3 -c \"from api_client import curl_get; import sys,time; print(curl_get('https://fapi.binance.com/fapi/v1/premiumIndex', sys.argv[2], sys.argv[3], f'symbol={sys.argv[1]}', int(time.time()*1000)))\" \"$symbol\" \"$api_key\" \"$secret\" | python3 -c \"import sys,json; print(json.loads(sys.stdin.read())['markPrice'])\"",
+          "description": "Retrieve the current futures mark price for the symbol."
+        },
+        {
+          "type": "function",
+          "name": "convert_dust",
+          "params": [
+            {"name": "asset", "type": "str"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"}
+          ],
+          "returns": "str",
+          "command": "python3 -c \"from api_client import curl_post; import sys,time; payload='asset='+sys.argv[1]; print(curl_post('https://api.binance.com/sapi/v1/asset/assetDustTransfer', sys.argv[2], sys.argv[3], payload, int(time.time()*1000)))\" \"$asset\" \"$api_key\" \"$secret\"",
+          "description": "Trigger Binance dust‑to‑BNB conversion for the given asset."
+        }
+      ],
+      "imports": ["api_client.py"]
+    },
+    "paper_trader.py": {
+      "description": "Simulates order execution, applying fees, slippage (using depth snapshot), and funding rates for futures.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "simulate_market_fill",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "side", "type": "str"},
+            {"name": "quantity", "type": "float"},
+            {"name": "depth_json", "type": "str"}
+          ],
+          "returns": "float",
+          "command": "python3 - <<'PY'\nimport sys,json\nsymbol,side,qty=sys.argv[1],sys.argv[2],float(sys.argv[3])\norderbook=json.loads(sys.argv[4])\nlevels=orderbook['bids'] if side.upper()=='BUY' else orderbook['asks']\nfilled=0.0; price=0.0\nfor p,vol in levels:\n    p=float(p); vol=float(vol)\n    take=min(qty-filled,vol)\n    price+=p*take\n    filled+=take\n    if filled>=qty:\n        break\navg=price/filled if filled else 0\nprint(avg)\nPY \"${symbol}\" \"${side}\" \"${quantity}\" \"${depth_json}\"",
+          "description": "Calculate volume‑weighted average price from depth to model slippage."
+        },
+        {
+          "type": "function",
+          "name": "apply_fees",
+          "params": [
+            {"name": "amount", "type": "float"},
+            {"name": "is_futures", "type": "bool"}
+          ],
+          "returns": "float",
+          "command": "python3 - <<'PY'\nimport sys\namt=float(sys.argv[1]); fut=sys.argv[2].lower()=='true'\nfee_rate=0.0002 if fut else 0.001\nprint(amt*(1-fee_rate))\nPY \"${amount}\" \"${is_futures}\"",
+          "description": "Deduct maker/taker fee from amount (default to taker)."
+        }
+      ],
+      "imports": []
+    },
+    "trade_logger.py": {
+      "description": "Persists every executed (real or paper) trade to SQLite and provides CSV export for tax reporting.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "init_db",
+          "params": [],
+          "returns": "None",
+          "command": "sqlite3 trades.db \"CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, symbol TEXT, side TEXT, qty REAL, price REAL, fee REAL, fee_asset TEXT, realized_pnl REAL, mode TEXT, order_id TEXT);\"",
+          "description": "Create the trades table if it does not exist."
+        },
+        {
+          "type": "function",
+          "name": "log_trade",
+          "params": [
+            {"name": "ts", "type": "int"},
+            {"name": "symbol", "type": "str"},
+            {"name": "side", "type": "str"},
+            {"name": "qty", "type": "float"},
+            {"name": "price", "type": "float"},
+            {"name": "fee", "type": "float"},
+            {"name": "fee_asset", "type": "str"},
+            {"name": "realized_pnl", "type": "float"},
+            {"name": "mode", "type": "str"},
+            {"name": "order_id", "type": "str"}
+          ],
+          "returns": "None",
+          "command": "sqlite3 trades.db \"INSERT INTO trades(ts,symbol,side,qty,price,fee,fee_asset,realized_pnl,mode,order_id) VALUES($ts,$symbol,$side,$qty,$price,$fee,$fee_asset,$realized_pnl,$mode,$order_id);\"",
+          "description": "Insert a trade record into the SQLite DB."
+        },
+        {
+          "type": "function",
+          "name": "export_csv",
+          "params": [
+            {"name": "filepath", "type": "str"}
+          ],
+          "returns": "None",
+          "command": "sqlite3 -header -csv trades.db \"SELECT * FROM trades;\" > $filepath",
+          "description": "Export the entire trade log to a CSV file for tax software."
+        }
+      ],
+      "imports": []
+    },
+    "cli.py": {
+      "description": "Command‑line interface parsing user commands, wiring together streams, indicators, risk checks and order execution.",
+      "exports": [
+        {
+          "type": "function",
+          "name": "run_bot",
+          "params": [
+            {"name": "symbol", "type": "str"},
+            {"name": "interval", "type": "str"},
+            {"name": "mode", "type": "str"},
+            {"name": "api_key", "type": "str"},
+            {"name": "secret", "type": "str"}
+          ],
+          "returns": "None",
+          "command": "python3 - <<'PY'\nimport sys,threading,queue,json,time\nfrom kline_stream import start_kline_ws, fetch_latest_kline\nfrom indicator import calc_rsi, calc_macd\nfrom risk_manager import calc_position_size, fetch_mark_price\nfrom order_engine import place_market_order, place_oco_order, place_stop_market_futures\nfrom paper_trader import simulate_market_fill, apply_fees\nfrom trade_logger import init_db, log_trade\nsymbol,interval,mode,api_key,secret=sys.argv[1:]\ninit_db()\nprice_q=queue.Queue()\n\ndef candle_cb(open_time, o, h, l, c, v):\n    price_q.put(float(c))\n\nthreading.Thread(target=start_kline_ws, args=(symbol,interval,'candle_cb'), daemon=True).start()\nwhile True:\n    try:\n        close=float(price_q.get(timeout=30))\n    except:\n        continue\n    # simple strategy: if RSI<30 buy, if RSI>70 sell\n    # fetch recent closes (placeholder list)\n    closes=[close]\n    rsi=calc_rsi(str(closes),14)\n    macd,signal,_=calc_macd(str(closes),12,26,9)\n    if mode=='paper':\n        # simulate fill using depth snapshot (omitted for brevity)\n        pass\n    else:\n        bal=10000  # placeholder, real balance fetched via account endpoint\n        qty=calc_position_size(bal,close,0.01,0.00001,5)\n        if rsi<30:\n            resp=place_market_order(symbol,'BUY',qty,api_key,secret)\n            log_trade(int(time.time()*1000),symbol,'BUY',qty,close,0.0,'USDT',0.0,mode,json.loads(resp)['orderId'])\n        elif rsi>70:\n            resp=place_market_order(symbol,'SELL',qty,api_key,secret)\n            log_trade(int(time.time()*1000),symbol,'SELL',qty,close,0.0,'USDT',0.0,mode,json.loads(resp)['orderId'])\nPY \"${symbol}\" \"${interval}\" \"${mode}\" \"${api_key}\" \"${secret}\"",
+          "description": "Entry point for the CLI; starts WS, runs indicator loop, and routes orders based on mode."
+        }
+      ],
+      "imports": ["kline_stream.py","indicator.py","risk_manager.py","order_engine.py","paper_trader.py","trade_logger.py"]
+    }
+  },
+  "phases": [
+    {
+      "id": "phase-1",
+      "name": "Foundation",
+      "description": "Core low‑level API client, database init and pure calculation utilities.",
+      "files": ["api_client.py","indicator.py","trade_logger.py"]
+    },
+    {
+      "id": "phase-2",
+      "name": "Data & Risk",
+      "description": "WebSocket handling, risk calculations, and order construction.",
+      "files": ["kline_stream.py","risk_manager.py","order_engine.py"]
+    },
+    {
+      "id": "phase-3",
+      "name": "Execution",
+      "description": "Paper‑trading simulation, live order routing, and CLI orchestration.",
+      "files": ["paper_trader.py","cli.py"]
+    }
+  ]
+}

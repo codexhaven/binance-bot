@@ -1,0 +1,1 @@
+Build a python binance trading bot with CLI. Features: Fetch real-time klines/candlestick data, calculate RSI and MACD indicators, support paper trading and live trading modes, and implement stop-loss/take-profit risk management.

@@ -1,20 +1,21 @@
-# Codex build artifacts
-.codex/
-reviews/
-CHANGELOG.md
-
-# Python
+.env
+*.key
+*.pem
+trades.db
+*.db
+trades_export.csv
+*.csv
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-venv/
-
-# Node
-node_modules/
-.next/
-
-# Env
-.env
-.env.local
+*.pyd
+.Python
+*.egg-info/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 *.log

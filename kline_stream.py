@@ -113,10 +113,10 @@ def fetch_latest_kline(symbol: str, interval: str,
     if not all(isinstance(v, str) for v in (symbol, interval, api_key, secret)):
         raise TypeError("symbol, interval, api_key, and secret must be strings")
 
-    timestamp = int(time.time() * 1000)
-    query = f"symbol={symbol.upper()}&interval={interval}&limit=1"
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": "1"}
     url = "https://api.binance.com/api/v3/klines"
-    response = curl_get(url, api_key, secret, f"{query}&timestamp={timestamp}")
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit=1"
+    response = subprocess.run(["curl", "-s", url], capture_output=True, text=True).stdout
     try:
         data = json.loads(response)
         if not isinstance(data, list) or not data:
