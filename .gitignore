@@ -1,0 +1,20 @@
+# Codex build artifacts
+.codex/
+reviews/
+CHANGELOG.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Node
+node_modules/
+.next/
+
+# Env
+.env
+.env.local
+*.log
