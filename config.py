@@ -14,7 +14,7 @@ SYMBOL = "BTCUSDT"
 INTERVAL = "15m"
 
 RSI_OVERSOLD = 40              # Raised from 35 -> 40 for more signals
-RSI_OVERBOUGHT = 70
+RSI_OVERBOUGHT = 78
 USE_MACD_CONFIRM = False
 
 # TREND FILTER - checks if SMA is RISING (uptrend), not if price > SMA
@@ -26,10 +26,10 @@ TREND_SLOPE_LOOKBACK = 5       # Compare current SMA to SMA 5 periods ago
 # RISK MANAGEMENT
 # ============================================================
 RISK_PER_TRADE = 0.02
-STOP_LOSS_PCT = 0.035
-TAKE_PROFIT_PCT = 0.025
+STOP_LOSS_PCT = 0.025
+TAKE_PROFIT_PCT = 0.045
 USE_TRAILING_STOP = True
-TRAILING_STOP_PCT = 0.025
+TRAILING_STOP_PCT = 0.030
 
 # ============================================================
 # POSITION MANAGEMENT
