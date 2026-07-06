@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Ensure the project root is on the import path for local modules
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -11,8 +11,6 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from api_client import curl_post, curl_get, _sign, _run_curl
-
-# ctx: codexhaven
 
 def _format_quantity(quantity: float, step_size: float) -> str:
     """
@@ -27,12 +25,17 @@ def _format_quantity(quantity: float, step_size: float) -> str:
     """
     if step_size <= 0:
         raise ValueError("step_size must be positive")
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+    
     # Determine number of decimal places in step_size
     step_str = f"{step_size:.16f}".rstrip('0')
     if '.' in step_str:
         precision = len(step_str.split('.')[1])
     else:
         precision = 0
+    
+    # Use floor to avoid exceeding balance due to rounding up
     adjusted = (int(quantity / step_size)) * step_size
     return f"{adjusted:.{precision}f}"
 
@@ -50,11 +53,15 @@ def _format_price(price: float, tick_size: float) -> str:
     """
     if tick_size <= 0:
         raise ValueError("tick_size must be positive")
+    if price <= 0:
+        raise ValueError("price must be positive")
+        
     tick_str = f"{tick_size:.16f}".rstrip('0')
     if '.' in tick_str:
         precision = len(tick_str.split('.')[1])
     else:
         precision = 0
+    
     adjusted = (int(price / tick_size)) * tick_size
     return f"{adjusted:.{precision}f}"
 
@@ -76,12 +83,15 @@ def place_market_order(symbol: str, side: str, quantity: float,
     Returns:
         Parsed JSON response from Binance as a dict.
     """
-    qty_str = _format_quantity(quantity, step_size)
-    payload = f"symbol={symbol}&side={side.upper()}&type=MARKET&quantity={qty_str}"
-    timestamp = int(time.time() * 1000)
-    url = "https://api.binance.com/api/v3/order"
-    response = curl_post(url, api_key, secret, payload, timestamp)
-    return json.loads(response)
+    try:
+        qty_str = _format_quantity(quantity, step_size)
+        payload = f"symbol={symbol}&side={side.upper()}&type=MARKET&quantity={qty_str}"
+        timestamp = int(time.time() * 1000)
+        url = "https://api.binance.com/api/v3/order"
+        response = curl_post(url, api_key, secret, payload, timestamp)
+        return json.loads(response)
+    except (json.JSONDecodeError, ValueError, RuntimeError) as e:
+        return {"code": -1, "msg": f"Order execution failed: {str(e)}"}
 
 
 def place_limit_order(symbol: str, side: str, quantity: float, price: float,
@@ -106,16 +116,19 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float,
     Returns:
         Parsed JSON response.
     """
-    qty_str = _format_quantity(quantity, step_size)
-    price_str = _format_price(price, tick_size)
-    payload = (
-        f"symbol={symbol}&side={side.upper()}&type=LIMIT&timeInForce={time_in_force}"
-        f"&quantity={qty_str}&price={price_str}"
-    )
-    timestamp = int(time.time() * 1000)
-    url = "https://api.binance.com/api/v3/order"
-    response = curl_post(url, api_key, secret, payload, timestamp)
-    return json.loads(response)
+    try:
+        qty_str = _format_quantity(quantity, step_size)
+        price_str = _format_price(price, tick_size)
+        payload = (
+            f"symbol={symbol}&side={side.upper()}&type=LIMIT&timeInForce={time_in_force}"
+            f"&quantity={qty_str}&price={price_str}"
+        )
+        timestamp = int(time.time() * 1000)
+        url = "https://api.binance.com/api/v3/order"
+        response = curl_post(url, api_key, secret, payload, timestamp)
+        return json.loads(response)
+    except (json.JSONDecodeError, ValueError, RuntimeError) as e:
+        return {"code": -1, "msg": f"Limit order failed: {str(e)}"}
 
 
 def place_oco_order(symbol: str, side: str, quantity: float,
@@ -123,45 +136,49 @@ def place_oco_order(symbol: str, side: str, quantity: float,
                     api_key: str, secret: str,
                     step_size: float = 0.000001,
                     tick_size: float = 0.000001,
-                    stop_limit_price: float = None,
+                    stop_limit_price: Optional[float] = None,
                     stop_limit_time_in_force: str = "GTC") -> Dict[str, Any]:
     """
-    Place an OCO (One‑Cancels‑Other) order on Binance Spot.
+    Place an OCO (One-Cancels-Other) order on Binance Spot.
 
     Args:
         symbol: Trading pair.
         side: "BUY" or "SELL".
         quantity: Base order quantity.
         price: Limit price for the primary order.
-        stop_price: Trigger price for the stop‑limit order.
+        stop_price: Trigger price for the stop-limit order.
         api_key: Binance API key.
         secret: Binance secret key.
         step_size: Quantity step size.
         tick_size: Price tick size.
-        stop_limit_price: Optional explicit stop‑limit price; if None,
+        stop_limit_price: Optional explicit stop-limit price; if None,
                           defaults to stop_price.
-        stop_limit_time_in_force: Time in force for the stop‑limit leg.
+        stop_limit_time_in_force: Time in force for the stop-limit leg.
 
     Returns:
         Parsed JSON response.
     """
-    qty_str = _format_quantity(quantity, step_size)
-    price_str = _format_price(price, tick_size)
-    stop_price_str = _format_price(stop_price, tick_size)
-    if stop_limit_price is None:
-        stop_limit_price = stop_price
-    stop_limit_price_str = _format_price(stop_limit_price, tick_size)
+    try:
+        qty_str = _format_quantity(quantity, step_size)
+        price_str = _format_price(price, tick_size)
+        stop_price_str = _format_price(stop_price, tick_size)
+        
+        if stop_limit_price is None:
+            stop_limit_price = stop_price
+        stop_limit_price_str = _format_price(stop_limit_price, tick_size)
 
-    payload = (
-        f"symbol={symbol}&side={side.upper()}&type=OCO&quantity={qty_str}"
-        f"&price={price_str}&stopPrice={stop_price_str}"
-        f"&stopLimitPrice={stop_limit_price_str}"
-        f"&stopLimitTimeInForce={stop_limit_time_in_force}"
-    )
-    timestamp = int(time.time() * 1000)
-    url = "https://api.binance.com/api/v3/order/oco"
-    response = curl_post(url, api_key, secret, payload, timestamp)
-    return json.loads(response)
+        payload = (
+            f"symbol={symbol}&side={side.upper()}&type=OCO&quantity={qty_str}"
+            f"&price={price_str}&stopPrice={stop_price_str}"
+            f"&stopLimitPrice={stop_limit_price_str}"
+            f"&stopLimitTimeInForce={stop_limit_time_in_force}"
+        )
+        timestamp = int(time.time() * 1000)
+        url = "https://api.binance.com/api/v3/order/oco"
+        response = curl_post(url, api_key, secret, payload, timestamp)
+        return json.loads(response)
+    except (json.JSONDecodeError, ValueError, RuntimeError) as e:
+        return {"code": -1, "msg": f"OCO order failed: {str(e)}"}
 
 
 def place_stop_market_futures(symbol: str, side: str, quantity: float,
@@ -183,16 +200,19 @@ def place_stop_market_futures(symbol: str, side: str, quantity: float,
     Returns:
         Parsed JSON response.
     """
-    qty_str = _format_quantity(quantity, step_size)
-    stop_price_str = f"{stop_price:.8f}"  # Futures typically allow 8‑dp precision
-    payload = (
-        f"symbol={symbol}&side={side.upper()}&type=STOP_MARKET"
-        f"&quantity={qty_str}&stopPrice={stop_price_str}"
-    )
-    timestamp = int(time.time() * 1000)
-    url = "https://fapi.binance.com/fapi/v1/order"
-    response = curl_post(url, api_key, secret, payload, timestamp)
-    return json.loads(response)
+    try:
+        qty_str = _format_quantity(quantity, step_size)
+        stop_price_str = f"{stop_price:.8f}"
+        payload = (
+            f"symbol={symbol}&side={side.upper()}&type=STOP_MARKET"
+            f"&quantity={qty_str}&stopPrice={stop_price_str}"
+        )
+        timestamp = int(time.time() * 1000)
+        url = "https://fapi.binance.com/fapi/v1/order"
+        response = curl_post(url, api_key, secret, payload, timestamp)
+        return json.loads(response)
+    except (json.JSONDecodeError, ValueError, RuntimeError) as e:
+        return {"code": -1, "msg": f"Futures stop order failed: {str(e)}"}
 
 
 def get_exchange_info(api_key: str, secret: str) -> Dict[str, Any]:
@@ -206,10 +226,13 @@ def get_exchange_info(api_key: str, secret: str) -> Dict[str, Any]:
     Returns:
         Parsed JSON dictionary containing exchange info.
     """
-    timestamp = int(time.time() * 1000)
-    url = "https://api.binance.com/api/v3/exchangeInfo"
-    response = curl_get(url, api_key, secret, timestamp)
-    return json.loads(response)
+    try:
+        timestamp = int(time.time() * 1000)
+        url = "https://api.binance.com/api/v3/exchangeInfo"
+        response = curl_get(url, api_key, secret, timestamp)
+        return json.loads(response)
+    except (json.JSONDecodeError, RuntimeError) as e:
+        return {"error": f"Failed to fetch exchange info: {str(e)}"}
 
 
 def get_symbol_filters(symbol: str, api_key: str, secret: str) -> Dict[str, Any]:
@@ -226,6 +249,9 @@ def get_symbol_filters(symbol: str, api_key: str, secret: str) -> Dict[str, Any]
         Dictionary of filter parameters for the symbol.
     """
     info = get_exchange_info(api_key, secret)
+    if "error" in info:
+        raise RuntimeError(info["error"])
+        
     for s in info.get("symbols", []):
         if s.get("symbol") == symbol.upper():
             filters = {f["filterType"]: f for f in s.get("filters", [])}
@@ -234,7 +260,6 @@ def get_symbol_filters(symbol: str, api_key: str, secret: str) -> Dict[str, Any]
 
 
 if __name__ == "__main__":
-    # Simple manual test harness
     if len(sys.argv) < 6:
         print("Usage: order_engine.py <symbol> <side> <qty> <price|stop> <mode>")
         sys.exit(1)
@@ -248,24 +273,31 @@ if __name__ == "__main__":
 
     symbol = sys.argv[1]
     side = sys.argv[2]
-    qty = float(sys.argv[3])
-
-    if mode == "market":
-        res = place_market_order(symbol, side, qty, api_key, secret)
-    elif mode == "limit":
-        price = float(sys.argv[4])
-        res = place_limit_order(symbol, side, qty, price, api_key, secret)
-    elif mode == "oco":
-        price = float(sys.argv[4])
-        stop_price = float(sys.argv[5])
-        res = place_oco_order(symbol, side, qty, price, stop_price,
-                              api_key, secret)
-    elif mode == "stop_market_futures":
-        stop_price = float(sys.argv[4])
-        res = place_stop_market_futures(symbol, side, qty, stop_price,
-                                        api_key, secret)
-    else:
-        print(f"Unsupported mode: {mode}")
+    try:
+        qty = float(sys.argv[3])
+    except ValueError:
+        print("Quantity must be a number")
         sys.exit(1)
 
-    print(json.dumps(res, indent=2))
+    try:
+        if mode == "market":
+            res = place_market_order(symbol, side, qty, api_key, secret)
+        elif mode == "limit":
+            price = float(sys.argv[4])
+            res = place_limit_order(symbol, side, qty, price, api_key, secret)
+        elif mode == "oco":
+            price = float(sys.argv[4])
+            stop_price = float(sys.argv[5])
+            res = place_oco_order(symbol, side, qty, price, stop_price,
+                                  api_key, secret)
+        elif mode == "stop_market_futures":
+            stop_price = float(sys.argv[4])
+            res = place_stop_market_futures(symbol, side, qty, stop_price,
+                                            api_key, secret)
+        else:
+            print(f"Unsupported mode: {mode}")
+            sys.exit(1)
+        print(json.dumps(res, indent=2))
+    except Exception as e:
+        print(f"Execution error: {str(e)}")
+        sys.exit(1)
