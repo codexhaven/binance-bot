@@ -163,13 +163,21 @@ def evaluate_signal(closes: List[float]) -> Optional[str]:
 
 
 def candle_callback_factory(price_queue: queue.Queue):
-    """Only process CLOSED candles — ignore intra-candle ticks."""
+    """
+    Only process CLOSED candles.
+    kline_stream calls: callback(open_time, o, h, l, c, v, is_closed)
+    """
     def candle_cb(*args):
         try:
-            is_closed = False
             close_price = 0.0
+            is_closed = False
 
-            if len(args) >= 5:
+            if len(args) >= 7:
+                # Format from kline_stream: (open_time, o, h, l, c, v, is_closed)
+                close_price = float(args[4])
+                is_closed = bool(args[6])
+            elif len(args) >= 5:
+                # Old format without is_closed (fallback)
                 close_price = float(args[4])
                 is_closed = True
             elif len(args) == 1:
@@ -178,27 +186,20 @@ def candle_callback_factory(price_queue: queue.Queue):
                     k = cd.get("k", cd)
                     if isinstance(k, dict):
                         close_price = float(k.get("c", k.get("close", 0)))
-                        is_closed = k.get("x", k.get("isClosed", True))
+                        is_closed = bool(k.get("x", k.get("isClosed", False)))
                     else:
                         close_price = float(cd.get("c", cd.get("close", 0)))
-                        is_closed = cd.get("x", cd.get("isClosed", True))
+                        is_closed = bool(cd.get("x", cd.get("isClosed", False)))
                 elif isinstance(cd, (list, tuple)):
                     close_price = float(cd[4]) if len(cd) > 4 else 0
                     is_closed = True
-                elif isinstance(cd, str):
-                    try:
-                        parsed = json.loads(cd)
-                        k = parsed.get("k", parsed)
-                        close_price = float(k.get("c", 0))
-                        is_closed = k.get("x", True)
-                    except Exception:
-                        return
                 else:
                     close_price = float(cd)
                     is_closed = True
             else:
                 return
 
+            # CRITICAL: Only queue when candle is actually closed
             if is_closed and close_price > 0:
                 price_queue.put_nowait(close_price)
         except queue.Full:

@@ -7,28 +7,14 @@ import time
 import threading
 from typing import Callable, List, Tuple
 
-# Ensure the project root is on the import path for local modules
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from api_client import curl_get  # noqa: E402
 
+
 def _run_websocat(command: List[str]) -> subprocess.Popen:
-    """
-    Launch websocat with the given command list and return the Popen object.
-    The stdout is piped line‑by‑line for processing.
-
-    Args:
-        command: List of command arguments for websocat.
-
-    Returns:
-        subprocess.Popen instance with stdout and stderr piped.
-
-    Raises:
-        TypeError: If command is not a list of strings.
-        RuntimeError: If the subprocess cannot be started.
-    """
     if not isinstance(command, list) or not all(isinstance(c, str) for c in command):
         raise TypeError("command must be a list of strings")
     try:
@@ -46,20 +32,11 @@ def _run_websocat(command: List[str]) -> subprocess.Popen:
 
 
 def start_kline_ws(symbol: str, interval: str,
-                   callback: Callable[[int, float, float, float, float, float], None]) -> None:
+                   callback: Callable) -> None:
     """
     Open a Binance kline WebSocket stream for the given symbol and interval.
     For each incoming candle, the callback is invoked with:
-        (open_time, open, high, low, close, volume)
-
-    Args:
-        symbol: Trading pair in lowercase (e.g., "btcusdt").
-        interval: Binance interval string (e.g., "1m", "5m").
-        callback: Function to handle parsed candle data.
-
-    Raises:
-        TypeError: If inputs are of incorrect type.
-        RuntimeError: If websocat cannot be started.
+        (open_time, open, high, low, close, volume, is_closed)
     """
     if not isinstance(symbol, str) or not isinstance(interval, str):
         raise TypeError("symbol and interval must be strings")
@@ -70,10 +47,7 @@ def start_kline_ws(symbol: str, interval: str,
     proc = _run_websocat(["websocat", "-t", ws_url])
 
     def _reader():
-        """
-        Reads lines from websocat stdout, parses JSON, and forwards candle data.
-        """
-        assert proc.stdout is not None  # for type checkers
+        assert proc.stdout is not None
         for line in proc.stdout:
             line = line.strip()
             if not line:
@@ -87,11 +61,11 @@ def start_kline_ws(symbol: str, interval: str,
                 l = float(k.get("l", 0))
                 c = float(k.get("c", 0))
                 v = float(k.get("v", 0))
-                callback(open_time, o, h, l, c, v)
+                is_closed = bool(k.get("x", False))
+                callback(open_time, o, h, l, c, v, is_closed)
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
                 sys.stderr.write(f"[kline_ws] Failed to parse line: {exc}\n")
                 continue
-        # If the loop exits, the subprocess likely terminated
         sys.stderr.write("[kline_ws] WebSocket reader stopped.\n")
 
     thread = threading.Thread(target=_reader, daemon=True)
@@ -99,22 +73,11 @@ def start_kline_ws(symbol: str, interval: str,
 
 
 def fetch_latest_kline(symbol: str, interval: str,
-                       api_key: str, secret: str) -> Tuple[int, float, float, float, float, float]:
-    """
-    Retrieve the most recent completed kline via Binance REST API.
-
-    Returns a tuple:
-        (open_time, open, high, low, close, volume)
-
-    Raises:
-        TypeError: If any argument is not a string.
-        RuntimeError: If the REST request fails or returns unexpected data.
-    """
+                       api_key: str, secret: str) -> Tuple[int, float, float, float, float, float, bool]:
+    """Retrieve the most recent kline via Binance REST API."""
     if not all(isinstance(v, str) for v in (symbol, interval, api_key, secret)):
         raise TypeError("symbol, interval, api_key, and secret must be strings")
 
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": "1"}
-    url = "https://api.binance.com/api/v3/klines"
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit=1"
     response = subprocess.run(["curl", "-s", url], capture_output=True, text=True).stdout
     try:
@@ -128,49 +91,25 @@ def fetch_latest_kline(symbol: str, interval: str,
         l = float(kline[3])
         c = float(kline[4])
         v = float(kline[5])
-        return open_time, o, h, l, c, v
+        return open_time, o, h, l, c, v, True
     except (json.JSONDecodeError, IndexError, ValueError, TypeError) as exc:
         raise RuntimeError(f"Failed to fetch latest kline: {exc}") from exc
 
 
 def reconcile_initial_candle(symbol: str, interval: str,
                             api_key: str, secret: str,
-                            ws_callback: Callable[[int, float, float, float, float, float], None]) -> None:
-    """
-    When starting the WS, the first candle may be incomplete. This helper fetches
-    the latest completed candle via REST and feeds it to the same callback before
-    the WS begins emitting new candles.
-
-    Args:
-        symbol: Trading pair (e.g., "btcusdt").
-        interval: Binance interval string.
-        api_key: Binance API key.
-        secret: Binance secret key.
-        ws_callback: Same callback used for WS processing.
-    """
+                            ws_callback: Callable) -> None:
+    """Fetch the latest candle via REST and feed it to the callback."""
     try:
-        open_time, o, h, l, c, v = fetch_latest_kline(symbol, interval, api_key, secret)
-        ws_callback(open_time, o, h, l, c, v)
+        open_time, o, h, l, c, v, is_closed = fetch_latest_kline(symbol, interval, api_key, secret)
+        ws_callback(open_time, o, h, l, c, v, is_closed)
     except Exception as exc:
         sys.stderr.write(f"[kline_reconcile] Unable to fetch initial candle: {exc}\n")
 
 
 def start_stream_with_reconciliation(symbol: str, interval: str,
                                      api_key: str, secret: str,
-                                     callback: Callable[[int, float, float, float, float, float], None]) -> None:
-    """
-    Convenience wrapper that first reconciles the latest completed candle via REST
-    and then starts the live WebSocket stream.
-
-    This ensures the strategy always has a full candle to work with before the
-    first real‑time update arrives.
-
-    Args:
-        symbol: Trading pair in lowercase.
-        interval: Binance interval string.
-        api_key: Binance API key.
-        secret: Binance secret key.
-        callback: Function to handle candle data.
-    """
+                                     callback: Callable) -> None:
+    """Reconcile latest candle via REST, then start live WS stream."""
     reconcile_initial_candle(symbol, interval, api_key, secret, callback)
     start_kline_ws(symbol, interval, callback)
