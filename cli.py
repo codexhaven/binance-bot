@@ -3,6 +3,7 @@
 Binance Trading Bot - Enhanced Edition v4
 =========================================
 Strategy: Buy oversold dips in uptrends (SMA rising)
+Only evaluates on candle CLOSE (not every tick).
 """
 import sys
 import os
@@ -11,6 +12,7 @@ import time
 import threading
 import queue
 import subprocess
+import sqlite3
 from typing import List, Optional, Dict, Any
 
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
@@ -161,22 +163,44 @@ def evaluate_signal(closes: List[float]) -> Optional[str]:
 
 
 def candle_callback_factory(price_queue: queue.Queue):
+    """Only process CLOSED candles — ignore intra-candle ticks."""
     def candle_cb(*args):
         try:
+            is_closed = False
+            close_price = 0.0
+
             if len(args) >= 5:
-                c = float(args[4])
+                close_price = float(args[4])
+                is_closed = True
             elif len(args) == 1:
                 cd = args[0]
                 if isinstance(cd, dict):
-                    c = float(cd.get("c", cd.get("close", 0)))
+                    k = cd.get("k", cd)
+                    if isinstance(k, dict):
+                        close_price = float(k.get("c", k.get("close", 0)))
+                        is_closed = k.get("x", k.get("isClosed", True))
+                    else:
+                        close_price = float(cd.get("c", cd.get("close", 0)))
+                        is_closed = cd.get("x", cd.get("isClosed", True))
                 elif isinstance(cd, (list, tuple)):
-                    c = float(cd[4]) if len(cd) > 4 else 0
+                    close_price = float(cd[4]) if len(cd) > 4 else 0
+                    is_closed = True
+                elif isinstance(cd, str):
+                    try:
+                        parsed = json.loads(cd)
+                        k = parsed.get("k", parsed)
+                        close_price = float(k.get("c", 0))
+                        is_closed = k.get("x", True)
+                    except Exception:
+                        return
                 else:
-                    c = float(cd)
+                    close_price = float(cd)
+                    is_closed = True
             else:
                 return
-            if c > 0:
-                price_queue.put_nowait(c)
+
+            if is_closed and close_price > 0:
+                price_queue.put_nowait(close_price)
         except queue.Full:
             pass
         except Exception:
@@ -187,6 +211,7 @@ def candle_callback_factory(price_queue: queue.Queue):
 def execute_trade(
     symbol: str, side: str, qty: float, price: float,
     mode: str, api_key: str, secret: str, reason: str = "SIGNAL",
+    realized_pnl: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
     ts = int(time.time() * 1000)
     if mode == "paper":
@@ -222,7 +247,7 @@ def execute_trade(
     try:
         log_trade(
             ts=ts, symbol=symbol, side=side, qty=qty, price=avg_price,
-            fee=fee, fee_asset="USDT", realized_pnl=0.0, mode=mode, order_id=order_id,
+            fee=fee, fee_asset="USDT", realized_pnl=realized_pnl, mode=mode, order_id=order_id,
         )
     except Exception as e:
         print(f"[ERROR] Failed to log trade: {e}", file=sys.stderr)
@@ -245,6 +270,7 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
     if config.USE_TRAILING_STOP:
         print(f"  Trailing stop: {config.TRAILING_STOP_PCT*100:.1f}% from peak")
     print(f"  Cooldown: {config.COOLDOWN_SECONDS}s  |  Max positions: {config.MAX_POSITIONS}")
+    print(f"  Signal eval: ON CANDLE CLOSE only")
     print("=" * 65)
     try:
         init_db()
@@ -271,10 +297,10 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
     else:
         balance = config.PAPER_BALANCE
         print(f"[INFO] Paper balance: {balance:.2f} {config.QUOTE_ASSET}")
-    print(f"[INFO] Bot running. Press Ctrl+C to stop.\n")
+    print(f"[INFO] Bot running. Evaluates on {interval} candle close. Press Ctrl+C to stop.\n")
     while True:
         try:
-            close_price = price_q.get(timeout=30)
+            close_price = price_q.get(timeout=60)
         except queue.Empty:
             continue
         except Exception as e:
@@ -304,6 +330,7 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
             sma_str = f" | SMA50: {sma_val:.2f}" if sma_val > 0 else ""
             trend_icon = "UP" if uptrend else "DN"
             print(f"[{ts_str}] {symbol} @ {close_price:.2f} | RSI: {rsi:.1f} | MACD: {macd:.2f} > {macd_signal:.2f}{sma_str} [{trend_icon}]{pos_str}")
+        # ---- EXIT LOGIC ----
         if position.in_position:
             position.update_trailing(close_price)
             exit_reason = position.check_exit(close_price, rsi)
@@ -316,11 +343,20 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
                     pnl = (result["price"] - position.entry_price) * position.qty - result["fee"]
                     pnl_pct = ((result["price"] - position.entry_price) / position.entry_price) * 100
                     print(f"  Realized PnL: {pnl:+.2f} USDT ({pnl_pct:+.2f}%)")
+                    try:
+                        conn = sqlite3.connect(config.DB_PATH)
+                        conn.execute("UPDATE trades SET realized_pnl=? WHERE order_id=? AND side='SELL'",
+                                     (pnl, result["order_id"]))
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
                     position.close()
                     last_trade_ts = int(time.time())
                     if mode == "paper":
                         balance += pnl
                 continue
+        # ---- ENTRY LOGIC ----
         if not position.in_position:
             now_ts = int(time.time())
             if now_ts - last_trade_ts < config.COOLDOWN_SECONDS:
