@@ -1,25 +1,57 @@
 #!/usr/bin/env python3
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import subprocess
 import hmac
 import hashlib
 import urllib.parse
 import time
-from typing import Dict
+from typing import Dict, Any
 
-# ctx: codexhaven
+# Ensure the project root is on the import path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def _sign(query_string: str, secret: str) -> str:
-    """Create HMAC SHA256 signature for Binance API."""
+    """
+    Create HMAC SHA256 signature for Binance API.
+
+    Args:
+        query_string: The URL‑encoded query string to sign.
+        secret: Binance secret key.
+
+    Returns:
+        Hexadecimal signature string.
+    """
+    if not isinstance(query_string, str):
+        raise TypeError("query_string must be a string")
+    if not isinstance(secret, str):
+        raise TypeError("secret must be a string")
     return hmac.new(secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
 
 def _run_curl(command: list) -> str:
-    """Execute a curl command and return stdout as string."""
-    result = subprocess.check_output(command, stderr=subprocess.STDOUT)
-    return result.decode().strip()
+    """
+    Execute a curl command and return stdout as a decoded string.
+
+    Args:
+        command: List of command arguments for subprocess.
+
+    Returns:
+        Decoded stdout from curl.
+
+    Raises:
+        RuntimeError: If curl exits with a non‑zero status.
+    """
+    if not isinstance(command, list) or not all(isinstance(c, str) for c in command):
+        raise TypeError("command must be a list of strings")
+    try:
+        result = subprocess.check_output(command, stderr=subprocess.STDOUT)
+        return result.decode().strip()
+    except subprocess.CalledProcessError as exc:
+        # Include curl's output for easier debugging
+        raise RuntimeError(f"curl command failed: {exc.output.decode().strip()}") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("curl executable not found on PATH") from exc
 
 
 def curl_get(
@@ -40,13 +72,26 @@ def curl_get(
         timestamp: Optional epoch ms; if None, current time is used.
 
     Returns:
-        Raw JSON response as string.
+        Raw JSON response as a string.
+
+    Raises:
+        ValueError: If required arguments are missing or empty.
+        RuntimeError: Propagated from _run_curl on failure.
     """
+    if not base_url:
+        raise ValueError("base_url must not be empty")
+    if not api_key:
+        raise ValueError("api_key must not be empty")
+    if not secret:
+        raise ValueError("secret must not be empty")
+    if params is None:
+        raise ValueError("params must be a dictionary, not None")
+
     if timestamp is None:
         timestamp = int(time.time() * 1000)
 
     # Add required timestamp
-    query = dict(params)
+    query = dict(params)  # shallow copy to avoid mutating caller data
     query["timestamp"] = str(timestamp)
 
     # Build query string for signature
@@ -85,8 +130,21 @@ def curl_post(
         timestamp: Optional epoch ms; if None, current time is used.
 
     Returns:
-        Raw JSON response as string.
+        Raw JSON response as a string.
+
+    Raises:
+        ValueError: If required arguments are missing or empty.
+        RuntimeError: Propagated from _run_curl on failure.
     """
+    if not base_url:
+        raise ValueError("base_url must not be empty")
+    if not api_key:
+        raise ValueError("api_key must not be empty")
+    if not secret:
+        raise ValueError("secret must not be empty")
+    if payload is None:
+        raise ValueError("payload must be a dictionary, not None")
+
     if timestamp is None:
         timestamp = int(time.time() * 1000)
 
@@ -98,8 +156,8 @@ def curl_post(
     # Build final URL with signature
     url = f"{base_url}?{query_string}&signature={signature}"
 
-    # Encode payload for curl -d
-    data = urllib.parse.urlencode(payload)
+    # Encode payload for curl -d; handle empty payload gracefully
+    data = urllib.parse.urlencode(payload) if payload else ""
 
     cmd = [
         "curl",
