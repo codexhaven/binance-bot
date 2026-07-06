@@ -2,7 +2,6 @@
 import json
 import sys
 import os
-import subprocess
 from typing import Dict, Any
 
 # Ensure the project root is on the import path for local modules
@@ -26,12 +25,15 @@ def simulate_market_fill(symbol: str, side: str, quantity: float, depth_json: st
     Returns:
         Average execution price as a float. Returns 0.0 if the order cannot be filled.
     """
-    if not isinstance(symbol, str):
-        raise TypeError("symbol must be a string")
-    if side.upper() not in ("BUY", "SELL"):
+    if not symbol or not isinstance(symbol, str):
+        raise TypeError("symbol must be a non-empty string")
+    if not side or side.upper() not in ("BUY", "SELL"):
         raise ValueError("side must be 'BUY' or 'SELL'")
     if quantity <= 0:
         raise ValueError("quantity must be positive")
+    if not depth_json:
+        raise ValueError("depth_json cannot be empty")
+    
     try:
         orderbook = json.loads(depth_json)
     except json.JSONDecodeError as exc:
@@ -45,9 +47,14 @@ def simulate_market_fill(symbol: str, side: str, quantity: float, depth_json: st
     filled = 0.0
     total_cost = 0.0
 
-    for price_str, vol_str in levels:
-        price = float(price_str)
-        vol = float(vol_str)
+    for entry in levels:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        try:
+            price = float(entry[0])
+            vol = float(entry[1])
+        except (ValueError, TypeError):
+            continue
 
         remaining = quantity - filled
         take = min(remaining, vol)
@@ -57,7 +64,7 @@ def simulate_market_fill(symbol: str, side: str, quantity: float, depth_json: st
         if filled >= quantity:
             break
 
-    if filled == 0:
+    if filled <= 0:
         return 0.0
     return total_cost / filled
 
@@ -75,8 +82,9 @@ def apply_fees(amount: float, is_futures: bool) -> float:
     """
     if amount < 0:
         raise ValueError("amount cannot be negative")
-    fee_rate = 0.0002 if is_futures else 0.001  # 0.02% futures, 0.1% spot
-    return amount * (1 - fee_rate)
+    # 0.02% futures, 0.1% spot
+    fee_rate = 0.0002 if is_futures else 0.001
+    return amount * (1.0 - fee_rate)
 
 
 def _fetch_order_book(symbol: str, limit: int = 100) -> Dict[str, Any]:
@@ -88,21 +96,32 @@ def _fetch_order_book(symbol: str, limit: int = 100) -> Dict[str, Any]:
     from api_client import curl_get  # Local import to avoid circular dependencies
     import time
 
+    if not symbol:
+        raise ValueError("symbol is required to fetch order book")
+
     url = "https://api.binance.com/api/v3/depth"
     timestamp = int(time.time() * 1000)
     query = f"symbol={symbol}&limit={limit}"
     full_url = f"{url}?{query}"
+    
     # Binance depth endpoint does not require signature, but we keep the pattern
-    response = curl_get(full_url, os.getenv("BINANCE_API_KEY", ""), os.getenv("BINANCE_SECRET", ""), timestamp)
+    api_key = os.getenv("BINANCE_API_KEY", "")
+    secret = os.getenv("BINANCE_SECRET", "")
+    
     try:
+        response = curl_get(full_url, api_key, secret, timestamp)
+        if not response:
+            raise RuntimeError("Empty response received from API")
         return json.loads(response)
     except json.JSONDecodeError:
         raise RuntimeError("Failed to parse order book JSON")
+    except Exception as exc:
+        raise RuntimeError(f"API request failed: {str(exc)}")
 
 
 def simulate_trade(symbol: str, side: str, quantity: float, is_futures: bool = False) -> Dict[str, float]:
     """
-    High‑level helper that fetches a depth snapshot, simulates the fill,
+    High-level helper that fetches a depth snapshot, simulates the fill,
     applies fees, and returns detailed results.
 
     Returns:
@@ -112,11 +131,21 @@ def simulate_trade(symbol: str, side: str, quantity: float, is_futures: bool = F
             "gross_amount": float  # quantity * avg_price
         }
     """
+    if not symbol or not side or quantity <= 0:
+        raise ValueError("Invalid trade parameters: symbol, side, and positive quantity are required")
+
     depth = _fetch_order_book(symbol)
     depth_json = json.dumps(depth)
     avg_price = simulate_market_fill(symbol, side, quantity, depth_json)
-    if avg_price == 0.0:
+    
+    if avg_price <= 0.0:
         raise RuntimeError("Unable to fill the simulated order with current depth")
+        
     gross = quantity * avg_price
     net = apply_fees(gross, is_futures)
-    return {"avg_price": avg_price, "gross_amount": gross, "net_amount": net}
+    
+    return {
+        "avg_price": avg_price, 
+        "gross_amount": gross, 
+        "net_amount": net
+    }
