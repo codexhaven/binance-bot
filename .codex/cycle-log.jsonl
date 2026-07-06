@@ -1,9 +1,0 @@
-{"cycle":1,"file":"api_client.py","mode":"NEW","desc":"","time":"2026-07-06T01:28:05Z"}
-{"cycle":2,"file":"indicator.py","mode":"NEW","desc":"","time":"2026-07-06T01:33:15Z"}
-{"cycle":3,"file":"trade_logger.py","mode":"NEW","desc":"","time":"2026-07-06T01:36:37Z"}
-{"cycle":4,"file":"kline_stream.py","mode":"NEW","desc":"","time":"2026-07-06T01:46:05Z"}
-{"cycle":5,"file":"risk_manager.py","mode":"NEW","desc":"","time":"2026-07-06T01:54:13Z"}
-{"cycle":6,"file":"order_engine.py","mode":"NEW","desc":"","time":"2026-07-06T02:00:23Z"}
-{"cycle":7,"file":"paper_trader.py","mode":"NEW","desc":"","time":"2026-07-06T02:07:37Z"}
-{"cycle":8,"file":"cli.py","mode":"NEW","desc":"","time":"2026-07-06T02:11:05Z"}
-{"cycle":9,"file":"README.md","mode":"NEW","desc":"","time":"2026-07-06T02:15:49Z"}

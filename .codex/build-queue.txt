@@ -1,9 +1,0 @@
-NEW:api_client.py
-NEW:indicator.py
-NEW:trade_logger.py
-NEW:kline_stream.py
-NEW:risk_manager.py
-NEW:order_engine.py
-NEW:paper_trader.py
-NEW:cli.py
-NEW:README.md
