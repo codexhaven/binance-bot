@@ -14,12 +14,20 @@ if PROJECT_ROOT not in sys.path:
 
 from api_client import curl_get  # noqa: E402
 
-# ctx: codexhaven
-
 def _run_websocat(command: List[str]) -> subprocess.Popen:
     """
     Launch websocat with the given command list and return the Popen object.
     The stdout is piped line‑by‑line for processing.
+
+    Args:
+        command: List of command arguments for websocat.
+
+    Returns:
+        subprocess.Popen instance with stdout and stderr piped.
+
+    Raises:
+        TypeError: If command is not a list of strings.
+        RuntimeError: If the subprocess cannot be started.
     """
     if not isinstance(command, list) or not all(isinstance(c, str) for c in command):
         raise TypeError("command must be a list of strings")
@@ -37,7 +45,8 @@ def _run_websocat(command: List[str]) -> subprocess.Popen:
         raise RuntimeError(f"Failed to start websocat: {exc}") from exc
 
 
-def start_kline_ws(symbol: str, interval: str, callback: Callable[[int, float, float, float, float, float], None]) -> None:
+def start_kline_ws(symbol: str, interval: str,
+                   callback: Callable[[int, float, float, float, float, float], None]) -> None:
     """
     Open a Binance kline WebSocket stream for the given symbol and interval.
     For each incoming candle, the callback is invoked with:
@@ -47,6 +56,10 @@ def start_kline_ws(symbol: str, interval: str, callback: Callable[[int, float, f
         symbol: Trading pair in lowercase (e.g., "btcusdt").
         interval: Binance interval string (e.g., "1m", "5m").
         callback: Function to handle parsed candle data.
+
+    Raises:
+        TypeError: If inputs are of incorrect type.
+        RuntimeError: If websocat cannot be started.
     """
     if not isinstance(symbol, str) or not isinstance(interval, str):
         raise TypeError("symbol and interval must be strings")
@@ -57,6 +70,9 @@ def start_kline_ws(symbol: str, interval: str, callback: Callable[[int, float, f
     proc = _run_websocat(["websocat", "-t", ws_url])
 
     def _reader():
+        """
+        Reads lines from websocat stdout, parses JSON, and forwards candle data.
+        """
         assert proc.stdout is not None  # for type checkers
         for line in proc.stdout:
             line = line.strip()
@@ -65,7 +81,6 @@ def start_kline_ws(symbol: str, interval: str, callback: Callable[[int, float, f
             try:
                 data = json.loads(line)
                 k = data.get("k", {})
-                # Extract required fields
                 open_time = int(k.get("t", 0))
                 o = float(k.get("o", 0))
                 h = float(k.get("h", 0))
@@ -74,15 +89,17 @@ def start_kline_ws(symbol: str, interval: str, callback: Callable[[int, float, f
                 v = float(k.get("v", 0))
                 callback(open_time, o, h, l, c, v)
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
-                # Log to stderr but keep the loop alive
                 sys.stderr.write(f"[kline_ws] Failed to parse line: {exc}\n")
                 continue
+        # If the loop exits, the subprocess likely terminated
+        sys.stderr.write("[kline_ws] WebSocket reader stopped.\n")
 
     thread = threading.Thread(target=_reader, daemon=True)
     thread.start()
 
 
-def fetch_latest_kline(symbol: str, interval: str, api_key: str, secret: str) -> Tuple[int, float, float, float, float, float]:
+def fetch_latest_kline(symbol: str, interval: str,
+                       api_key: str, secret: str) -> Tuple[int, float, float, float, float, float]:
     """
     Retrieve the most recent completed kline via Binance REST API.
 
@@ -90,7 +107,8 @@ def fetch_latest_kline(symbol: str, interval: str, api_key: str, secret: str) ->
         (open_time, open, high, low, close, volume)
 
     Raises:
-        RuntimeError if the REST request fails or returns unexpected data.
+        TypeError: If any argument is not a string.
+        RuntimeError: If the REST request fails or returns unexpected data.
     """
     if not all(isinstance(v, str) for v in (symbol, interval, api_key, secret)):
         raise TypeError("symbol, interval, api_key, and secret must be strings")
@@ -103,9 +121,7 @@ def fetch_latest_kline(symbol: str, interval: str, api_key: str, secret: str) ->
         data = json.loads(response)
         if not isinstance(data, list) or not data:
             raise ValueError("Empty kline data")
-        kline = data[0]  # Binance returns list of lists
-        # Binance kline format:
-        # [Open time, Open, High, Low, Close, Volume, Close time, ...]
+        kline = data[0]
         open_time = int(kline[0])
         o = float(kline[1])
         h = float(kline[2])
@@ -113,11 +129,12 @@ def fetch_latest_kline(symbol: str, interval: str, api_key: str, secret: str) ->
         c = float(kline[4])
         v = float(kline[5])
         return open_time, o, h, l, c, v
-    except (json.JSONDecodeError, IndexError, ValueError) as exc:
+    except (json.JSONDecodeError, IndexError, ValueError, TypeError) as exc:
         raise RuntimeError(f"Failed to fetch latest kline: {exc}") from exc
 
 
-def reconcile_initial_candle(symbol: str, interval: str, api_key: str, secret: str,
+def reconcile_initial_candle(symbol: str, interval: str,
+                            api_key: str, secret: str,
                             ws_callback: Callable[[int, float, float, float, float, float], None]) -> None:
     """
     When starting the WS, the first candle may be incomplete. This helper fetches
@@ -127,7 +144,8 @@ def reconcile_initial_candle(symbol: str, interval: str, api_key: str, secret: s
     Args:
         symbol: Trading pair (e.g., "btcusdt").
         interval: Binance interval string.
-        api_key, secret: Binance credentials.
+        api_key: Binance API key.
+        secret: Binance secret key.
         ws_callback: Same callback used for WS processing.
     """
     try:
@@ -146,6 +164,13 @@ def start_stream_with_reconciliation(symbol: str, interval: str,
 
     This ensures the strategy always has a full candle to work with before the
     first real‑time update arrives.
+
+    Args:
+        symbol: Trading pair in lowercase.
+        interval: Binance interval string.
+        api_key: Binance API key.
+        secret: Binance secret key.
+        callback: Function to handle candle data.
     """
     reconcile_initial_candle(symbol, interval, api_key, secret, callback)
     start_kline_ws(symbol, interval, callback)
