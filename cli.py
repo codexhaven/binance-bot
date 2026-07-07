@@ -27,6 +27,7 @@ from order_engine import place_market_order
 from paper_trader import simulate_market_fill, apply_fees
 from trade_logger import init_db, log_trade, get_last_trade
 from api_client import curl_get
+from ai_predictor import AIPredictor, extract_features as ai_extract_features
 
 
 def load_env():
@@ -145,21 +146,51 @@ def fetch_recent_closes(symbol: str, interval: str, count: int = 200) -> List[fl
         print(f"[ERROR] Failed to fetch closes: {e}", file=sys.stderr)
         return []
 
-
-def evaluate_signal(closes: List[float]) -> Optional[str]:
-    if len(closes) < config.MIN_CANDLES_FOR_SIGNAL:
-        return None
+def fetch_recent_candles(symbol: str, interval: str, count: int = 250) -> List[Dict]:
+    """Fetch full OHLCV candle history for AI feature extraction."""
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={count}"
     try:
-        rsi = calc_rsi(closes, period=14)
+        raw = subprocess.run(["curl", "-s", url], capture_output=True, text=True, timeout=15).stdout
+        data = json.loads(raw)
+        if isinstance(data, dict) and data.get("code"):
+            print(f"[ERROR] Binance klines error: {data.get('msg')}", file=sys.stderr)
+            return []
+        candles = []
+        for k in data:
+            candles.append({
+                "open_time": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+            })
+        return candles
     except Exception as e:
-        print(f"[WARN] Indicator calc error: {e}", file=sys.stderr)
-        return None
-    if rsi < config.RSI_OVERSOLD:
-        if config.USE_TREND_FILTER:
-            if not is_uptrend(closes, config.TREND_SMA_PERIOD, config.TREND_SLOPE_LOOKBACK):
-                return None
-        return "BUY"
-    return None
+        print(f"[ERROR] Failed to fetch candles: {e}", file=sys.stderr)
+        return []
+
+
+# Global AI predictor cache
+ai_predictors: Dict[str, AIPredictor] = {}
+
+def get_ai_predictor(symbol: str) -> AIPredictor:
+    """Load AI model for symbol (cached)"""
+    if symbol not in ai_predictors:
+        ai_predictors[symbol] = AIPredictor(symbol)
+    return ai_predictors[symbol]
+
+def evaluate_signal_ai(candles: list, symbol: str) -> tuple:
+    """AI-powered entry signal. Returns (signal, confidence)"""
+    if len(candles) < 200:
+        return None, 0.0
+    ai = get_ai_predictor(symbol)
+    if not ai.trees:
+        return None, 0.0
+    should_buy, proba = ai.predict(candles)
+    if should_buy:
+        return "BUY", proba
+    return None, proba
 
 
 def candle_callback_factory(price_queue: queue.Queue):
@@ -169,39 +200,72 @@ def candle_callback_factory(price_queue: queue.Queue):
     """
     def candle_cb(*args):
         try:
-            close_price = 0.0
+            candle = None
             is_closed = False
 
             if len(args) >= 7:
                 # Format from kline_stream: (open_time, o, h, l, c, v, is_closed)
-                close_price = float(args[4])
+                candle = {
+                    "open_time": int(args[0]),
+                    "open": float(args[1]),
+                    "high": float(args[2]),
+                    "low": float(args[3]),
+                    "close": float(args[4]),
+                    "volume": float(args[5]),
+                }
                 is_closed = bool(args[6])
             elif len(args) >= 5:
-                # Old format without is_closed (fallback)
-                close_price = float(args[4])
+                candle = {
+                    "open_time": int(args[0]),
+                    "open": float(args[1]),
+                    "high": float(args[2]),
+                    "low": float(args[3]),
+                    "close": float(args[4]),
+                    "volume": float(args[5]) if len(args) > 5 else 0,
+                }
                 is_closed = True
             elif len(args) == 1:
                 cd = args[0]
                 if isinstance(cd, dict):
                     k = cd.get("k", cd)
                     if isinstance(k, dict):
-                        close_price = float(k.get("c", k.get("close", 0)))
+                        candle = {
+                            "open_time": int(k.get("t", k.get("open_time", 0))),
+                            "open": float(k.get("o", k.get("open", 0))),
+                            "high": float(k.get("h", k.get("high", 0))),
+                            "low": float(k.get("l", k.get("low", 0))),
+                            "close": float(k.get("c", k.get("close", 0))),
+                            "volume": float(k.get("v", k.get("volume", 0))),
+                        }
                         is_closed = bool(k.get("x", k.get("isClosed", False)))
                     else:
-                        close_price = float(cd.get("c", cd.get("close", 0)))
+                        candle = {
+                            "open_time": int(cd.get("t", cd.get("open_time", 0))),
+                            "open": float(cd.get("o", cd.get("open", 0))),
+                            "high": float(cd.get("h", cd.get("high", 0))),
+                            "low": float(cd.get("l", cd.get("low", 0))),
+                            "close": float(cd.get("c", cd.get("close", 0))),
+                            "volume": float(cd.get("v", cd.get("volume", 0))),
+                        }
                         is_closed = bool(cd.get("x", cd.get("isClosed", False)))
                 elif isinstance(cd, (list, tuple)):
-                    close_price = float(cd[4]) if len(cd) > 4 else 0
+                    candle = {
+                        "open_time": int(cd[0]) if len(cd) > 0 else 0,
+                        "open": float(cd[1]) if len(cd) > 1 else 0,
+                        "high": float(cd[2]) if len(cd) > 2 else 0,
+                        "low": float(cd[3]) if len(cd) > 3 else 0,
+                        "close": float(cd[4]) if len(cd) > 4 else 0,
+                        "volume": float(cd[5]) if len(cd) > 5 else 0,
+                    }
                     is_closed = True
                 else:
-                    close_price = float(cd)
-                    is_closed = True
+                    return
             else:
                 return
 
             # CRITICAL: Only queue when candle is actually closed
-            if is_closed and close_price > 0:
-                price_queue.put_nowait(close_price)
+            if is_closed and candle and candle["close"] > 0:
+                price_queue.put_nowait(candle)
         except queue.Full:
             pass
         except Exception:
@@ -266,7 +330,7 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
     print("=" * 65)
     print("  BINANCE TRADING BOT - ENHANCED EDITION v4")
     print(f"  Symbol: {symbol}  |  Interval: {interval}  |  Mode: {mode.upper()}")
-    print(f"  Strategy: RSI<{config.RSI_OVERSOLD} BUY, RSI>{config.RSI_OVERBOUGHT} SELL{trend_str}")
+    print(f"  Strategy: AI Random Forest (150 trees, 20 features){trend_str}")
     print(f"  Risk: {config.RISK_PER_TRADE*100:.1f}%/trade  |  SL: {config.STOP_LOSS_PCT*100:.1f}%  |  TP: {config.TAKE_PROFIT_PCT*100:.1f}%")
     if config.USE_TRAILING_STOP:
         print(f"  Trailing stop: {config.TRAILING_STOP_PCT*100:.1f}% from peak")
@@ -286,12 +350,20 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
         threading.Thread(target=start_kline_ws, args=(symbol.lower(), interval, candle_cb), daemon=True).start()
     except Exception as e:
         print(f"[ERROR] WS start failed: {e}", file=sys.stderr)
-    print(f"\n[INFO] Fetching {symbol} candle history...")
-    recent_closes = fetch_recent_closes(symbol, interval, count=200)
-    if recent_closes:
-        print(f"[INFO] Loaded {len(recent_closes)} candles. Last close: {recent_closes[-1]:.2f}")
+    print(f"\n[INFO] Fetching {symbol} candle history (250 candles for AI)...")
+    recent_candles = fetch_recent_candles(symbol, interval, count=250)
+    recent_closes = [c["close"] for c in recent_candles]
+    if recent_candles:
+        print(f"[INFO] Loaded {len(recent_candles)} candles. Last close: {recent_candles[-1]['close']:.2f}")
+        # Pre-load AI model
+        ai = get_ai_predictor(symbol)
+        if ai.trees:
+            # Quick test prediction on current data
+            _, test_proba = ai.predict(recent_candles)
+            print(f"[INFO] AI model ready. Current confidence: {test_proba*100:.1f}% (threshold: {ai.threshold*100:.0f}%)")
     else:
         print("[WARN] No candle data; waiting for websocket...")
+        recent_candles = []
     if mode == "live":
         balance = fetch_real_balance(api_key, secret, config.QUOTE_ASSET)
         print(f"[INFO] Real {config.QUOTE_ASSET} balance: {balance:.2f}")
@@ -301,13 +373,28 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
     print(f"[INFO] Bot running. Evaluates on {interval} candle close. Press Ctrl+C to stop.\n")
     while True:
         try:
-            close_price = price_q.get(timeout=60)
+            candle_data = price_q.get(timeout=60)
+            close_price = candle_data["close"] if isinstance(candle_data, dict) else candle_data
         except queue.Empty:
+            # Heartbeat: show we're alive and waiting
+            mins_to_close = 15 - (int(time.time()) // 60 % 15)
+            ai_pct = 0.0
+            if recent_candles and len(recent_candles) >= 200:
+                try:
+                    _, ai_pct = evaluate_signal_ai(recent_candles, symbol)
+                except:
+                    pass
+            last_price = recent_closes[-1] if recent_closes else 0
+            print(f"[{time.strftime('%H:%M:%S')}] Waiting for next candle close ({mins_to_close}m) | {symbol} @ {last_price:.2f} | AI: {ai_pct*100:.1f}%", end="\r", flush=True)
             continue
         except Exception as e:
             print(f"[ERROR] Queue error: {e}", file=sys.stderr)
             continue
         recent_closes.append(close_price)
+        if isinstance(candle_data, dict):
+            recent_candles.append(candle_data)
+            if len(recent_candles) > 300:
+                recent_candles.pop(0)
         if len(recent_closes) > 200:
             recent_closes.pop(0)
         if len(recent_closes) < config.MIN_CANDLES_FOR_SIGNAL:
@@ -330,7 +417,10 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
                            f" | PnL: {pnl_pct:+.2f}%")
             sma_str = f" | SMA50: {sma_val:.2f}" if sma_val > 0 else ""
             trend_icon = "UP" if uptrend else "DN"
-            print(f"[{ts_str}] {symbol} @ {close_price:.2f} | RSI: {rsi:.1f} | MACD: {macd:.2f} > {macd_signal:.2f}{sma_str} [{trend_icon}]{pos_str}")
+            ai_conf = 0.0
+            if len(recent_candles) >= 200:
+                _, ai_conf = evaluate_signal_ai(recent_candles, symbol)
+            print(f"[{ts_str}] {symbol} @ {close_price:.2f} | RSI: {rsi:.1f} | MACD: {macd:.2f} > {macd_signal:.2f}{sma_str} [{trend_icon}] | AI: {ai_conf*100:.0f}%{pos_str}")
         # ---- EXIT LOGIC ----
         if position.in_position:
             position.update_trailing(close_price)
@@ -362,16 +452,16 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
             now_ts = int(time.time())
             if now_ts - last_trade_ts < config.COOLDOWN_SECONDS:
                 continue
-            signal = evaluate_signal(recent_closes)
+            signal, ai_proba = evaluate_signal_ai(recent_candles, symbol)
             if signal != "BUY":
                 continue
             trend_note = " | Trend: SMA rising" if uptrend else ""
-            print(f"\n[SIGNAL] BUY signal detected! RSI={rsi:.1f}{trend_note}")
+            print(f"\n[SIGNAL] AI BUY signal detected! Confidence={ai_proba*100:.1f}%{trend_note}")
             qty = calc_position_size(balance=balance, price=close_price, risk_pct=config.RISK_PER_TRADE, step_size=config.STEP_SIZE, min_notional=config.MIN_NOTIONAL)
             if qty <= 0:
                 print("[WARN] Quantity too small; skipping.", file=sys.stderr)
                 continue
-            result = execute_trade(symbol, "BUY", qty, close_price, mode, api_key, secret, reason="RSI OVERSOLD")
+            result = execute_trade(symbol, "BUY", qty, close_price, mode, api_key, secret, reason="AI SIGNAL")
             if result:
                 position.open(result["price"], result["qty"], side="LONG")
                 print(f"  Position opened: SL={position.stop_loss:.2f} | TP={position.take_profit:.2f}")

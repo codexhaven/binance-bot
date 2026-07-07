@@ -58,3 +58,6 @@ TRADING_FEE_PCT = 0.001
 LOG_STATUS_EVERY_TICK = True
 DB_PATH = "trades.db"
 CSV_PATH = "trades_export.csv"
+
+# AI Settings
+AI_THRESHOLD = 0.70  # Backtest-proven sweet spot (75% = 100% win rate on ETH)
