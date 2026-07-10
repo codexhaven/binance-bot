@@ -26,10 +26,10 @@ TREND_SLOPE_LOOKBACK = 5       # Compare current SMA to SMA 5 periods ago
 # RISK MANAGEMENT
 # ============================================================
 RISK_PER_TRADE = 0.02
-STOP_LOSS_PCT = 0.025
-TAKE_PROFIT_PCT = 0.045
+STOP_LOSS_PCT = 0.012
+TAKE_PROFIT_PCT = 0.020
 USE_TRAILING_STOP = True
-TRAILING_STOP_PCT = 0.030
+TRAILING_STOP_PCT = 0.0150
 
 # ============================================================
 # POSITION MANAGEMENT

@@ -343,6 +343,18 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
         print(f"[ERROR] DB init failed: {e}", file=sys.stderr)
         return
     position = Position()
+    # Load open position from DB if exists
+    try:
+        conn = sqlite3.connect(config.DB_PATH)
+        row = conn.execute("SELECT symbol, qty, entry_price, stop_loss, take_profit FROM positions WHERE symbol=?", (symbol,)).fetchone()
+        conn.close()
+        if row:
+            position.open(row[2], row[1], side="LONG")
+            position.stop_loss = row[3]
+            position.take_profit = row[4]
+            print(f"[INFO] Restored open position: {row[1]:.6f} @ {row[2]:.2f} | SL: {row[3]:.2f} | TP: {row[4]:.2f}")
+    except Exception as e:
+        print(f"[INFO] No saved position to restore: {e}")
     last_trade_ts = 0
     price_q: queue.Queue = queue.Queue(maxsize=10)
     candle_cb = candle_callback_factory(price_q)
@@ -377,15 +389,60 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
             close_price = candle_data["close"] if isinstance(candle_data, dict) else candle_data
         except queue.Empty:
             # Heartbeat: show we're alive and waiting
-            mins_to_close = 15 - (int(time.time()) // 60 % 15)
+            interval_mins = int(interval[:-1]) if interval.endswith('m') else int(interval[:-1]) * 60 if interval.endswith('h') else 15
+            mins_to_close = interval_mins - (int(time.time()) // 60 % interval_mins)
             ai_pct = 0.0
             if recent_candles and len(recent_candles) >= 200:
                 try:
                     _, ai_pct = evaluate_signal_ai(recent_candles, symbol)
                 except:
                     pass
-            last_price = recent_closes[-1] if recent_closes else 0
-            print(f"[{time.strftime('%H:%M:%S')}] Waiting for next candle close ({mins_to_close}m) | {symbol} @ {last_price:.2f} | AI: {ai_pct*100:.1f}%", end="\r", flush=True)
+            
+            # Fetch live price for exit checking
+            try:
+                ticker_url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+                import urllib.request
+                with urllib.request.urlopen(ticker_url, timeout=5) as resp:
+                    import json
+                    live_price = float(json.loads(resp.read())["price"])
+            except Exception as conn_err:
+                print(f"\n[{time.strftime('%H:%M:%S')}] [WARN] Network lost — retrying in 15s...", end="\r", flush=True)
+                time.sleep(15)
+                continue
+            
+            # Check exits on EVERY heartbeat (not just candle close!)
+            if position.in_position and live_price > 0:
+                position.update_trailing(live_price)
+                exit_reason = position.check_exit(live_price, 0)  # RSI=0, skip RSI exit
+                if exit_reason:
+                    reason_map = {"SL": "STOP-LOSS HIT", "TP": "TAKE-PROFIT HIT", "SIG": "RSI OVERBOUGHT SELL"}
+                    reason_str = reason_map.get(exit_reason, exit_reason)
+                    pnl_pct = ((live_price - position.entry_price) / position.entry_price) * 100
+                    print(f"\n[EXIT] {reason_str} for {symbol} @ {live_price:.2f}!")
+                    result = execute_trade(symbol, "SELL", position.qty, live_price, mode, api_key, secret, reason=reason_str)
+                    if result:
+                        pnl = (result["price"] - position.entry_price) * position.qty - result["fee"]
+                        pnl_pct = ((result["price"] - position.entry_price) / position.entry_price) * 100
+                        print(f"  Realized PnL: {pnl:+.2f} USDT ({pnl_pct:+.2f}%)")
+                        try:
+                            conn = sqlite3.connect(config.DB_PATH)
+                            conn.execute("UPDATE trades SET realized_pnl=? WHERE order_id=? AND side='SELL'", (pnl, result["order_id"]))
+                            conn.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+                            conn.commit(); conn.close()
+                        except Exception:
+                            pass
+                        position.close()
+                        last_trade_ts = int(time.time())
+                        if mode == "paper":
+                            balance += pnl
+                    continue
+            
+            # Show position info in heartbeat
+            pos_str = ""
+            if position.in_position:
+                pnl_pct = ((live_price - position.entry_price) / position.entry_price) * 100
+                pos_str = f" | POS: {position.qty:.6f} @ {position.entry_price:.2f} | SL: {position.stop_loss:.2f} | TP: {position.take_profit:.2f} | PnL: {pnl_pct:+.2f}%"
+            print(f"[{time.strftime('%H:%M:%S')}] Waiting for next candle close ({mins_to_close}m) | {symbol} @ {live_price:.2f} | AI: {ai_pct*100:.1f}%{pos_str}", end="\r", flush=True)
             continue
         except Exception as e:
             print(f"[ERROR] Queue error: {e}", file=sys.stderr)
@@ -444,6 +501,12 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
                         pass
                     position.close()
                     last_trade_ts = int(time.time())
+                    try:
+                        conn = sqlite3.connect(config.DB_PATH)
+                        conn.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+                        conn.commit(); conn.close()
+                    except Exception:
+                        pass
                     if mode == "paper":
                         balance += pnl
                 continue
@@ -455,8 +518,13 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
             signal, ai_proba = evaluate_signal_ai(recent_candles, symbol)
             if signal != "BUY":
                 continue
-            trend_note = " | Trend: SMA rising" if uptrend else ""
-            print(f"\n[SIGNAL] AI BUY signal detected! Confidence={ai_proba*100:.1f}%{trend_note}")
+            
+            # ENFORCE TREND FILTER: No buying in downtrends!
+            if config.USE_TREND_FILTER and not uptrend:
+                print(f"\n[SKIP] AI Signal ({ai_proba*100:.1f}%) but SMA50 trending DOWN. Skipping.")
+                continue
+                
+            print(f"\n[SIGNAL] AI BUY signal detected! Confidence={ai_proba*100:.1f}% | Trend: UP")
             qty = calc_position_size(balance=balance, price=close_price, risk_pct=config.RISK_PER_TRADE, step_size=config.STEP_SIZE, min_notional=config.MIN_NOTIONAL)
             if qty <= 0:
                 print("[WARN] Quantity too small; skipping.", file=sys.stderr)
@@ -464,9 +532,19 @@ def run_bot(symbol: str, interval: str, mode: str, api_key: str, secret: str) ->
             result = execute_trade(symbol, "BUY", qty, close_price, mode, api_key, secret, reason="AI SIGNAL")
             if result:
                 position.open(result["price"], result["qty"], side="LONG")
+                last_trade_ts = int(time.time())
                 print(f"  Position opened: SL={position.stop_loss:.2f} | TP={position.take_profit:.2f}")
                 if config.USE_TRAILING_STOP:
                     print(f"  Trailing stop active: {config.TRAILING_STOP_PCT*100:.1f}% from peak")
+                # Persist position to DB
+                try:
+                    conn = sqlite3.connect(config.DB_PATH)
+                    conn.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
+                    conn.execute("INSERT INTO positions (symbol, qty, entry_price, stop_loss, take_profit, opened_at) VALUES (?,?,?,?,?,?)",
+                                 (symbol, position.qty, position.entry_price, position.stop_loss, position.take_profit, int(time.time()*1000)))
+                    conn.commit(); conn.close()
+                except Exception as e:
+                    print(f"[WARN] Position save failed: {e}", file=sys.stderr)
                 last_trade_ts = int(time.time())
 
 

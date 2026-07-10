@@ -1,28 +1,7 @@
-# SECRETS - NEVER COMMIT
-.env
-*.key
-*.pem
-
-# Database & Logs
-*.db
-*.log
-*_log.txt
-*_ai_log.txt
-
-# Python cache
 __pycache__/
 *.pyc
-*.pyo
-
-# Large data files (keep local, don't push)
-*_dataset.csv
-trades_export.csv
-
-# AI models (large binary files)
 *.pkl
-
-# Fix scripts (already deleted, but just in case)
-fix_*.py
-patch_*.py
-add_*.py
-.codex/
+trades.db
+trades_export.csv
+*_ai_log.txt
+.env
